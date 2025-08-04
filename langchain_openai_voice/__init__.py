@@ -61,7 +61,7 @@ async def connect(*, api_key: str, model: str, url: str, max_retries: int = 3) -
         try:
             websocket = await websockets.connect(
                 url, 
-                additional_headers=headers,  # extra_headers → additional_headers
+                extra_headers=headers,
                 open_timeout=60, 
                 close_timeout=60,
                 ping_interval=None,  # 클라이언트 ping 비활성화

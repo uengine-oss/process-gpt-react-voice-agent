@@ -1,4 +1,4 @@
-# Process GPT Voice Agent
+# Process GPT React Voice Agent
 
 ## 설치 및 실행
 

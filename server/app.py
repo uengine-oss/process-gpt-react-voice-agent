@@ -52,9 +52,6 @@ async def websocket_endpoint(websocket: WebSocket):
         f"tenant_id는 '{user_info.get('tenant_id')}' 입니다."
     )
     
-    # 음성 중단을 위한 이벤트
-    stop_event = asyncio.Event()
-
     print(f"OpenAI API Key 설정됨: {bool(os.getenv('OPENAI_API_KEY'))}")
     print(f"사용자 정보: {user_info}")
     
@@ -63,11 +60,12 @@ async def websocket_endpoint(websocket: WebSocket):
         tools=TOOLS,
         instructions=instructions_with_user,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
-        user_info=user_info
+        user_info=user_info,
+        silence_duration_ms=1200  # 1.2초로 단축 (빠른 응답)
     )
 
     try:
-        await agent.aconnect(browser_receive_stream, websocket.send_text, stop_event)
+        await agent.aconnect(browser_receive_stream, websocket.send_text)
     except Exception as e:
         print(f"Agent 연결 에러: {e}")
         try:

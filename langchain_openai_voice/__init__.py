@@ -23,10 +23,8 @@ EVENTS_TO_IGNORE = {
     "response.content_part.added",
     "response.content_part.done",
     "conversation.item.created",
-    "response.audio.done",
     "session.created",
     "session.updated",
-    "response.done",
     "response.output_item.done",
 }
 
@@ -64,21 +62,17 @@ async def connect(*, api_key: str, model: str, url: str, max_retries: int = 3) -
                 extra_headers=headers,
                 open_timeout=60, 
                 close_timeout=60,
-                ping_interval=None,  # 클라이언트 ping 비활성화
-                ping_timeout=None,   # 클라이언트 ping 비활성화
+                ping_interval=20,    # 20초마다 ping (연결 상태 모니터링)
+                ping_timeout=10,     # 10초 내 pong 응답 대기
                 max_size=2**20     # 최대 메시지 크기
             )
-            print(f"WebSocket 연결 성공 (시도 {attempt + 1}/{max_retries})")
             break
         except Exception as e:
             last_error = e
-            print(f"WebSocket 연결 실패 (시도 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)  # 지수 백오프
             else:
-                print(f"최대 재시도 횟수 초과. 최종 에러: {e}")
-                print(f"URL: {url}")
-                print(f"Headers: {headers}")
+                print(f"WebSocket 연결 실패: {e}")
                 raise last_error
 
     try:
@@ -87,11 +81,7 @@ async def connect(*, api_key: str, model: str, url: str, max_retries: int = 3) -
             try:
                 formatted_event = json.dumps(event) if isinstance(event, dict) else event
                 await websocket.send(formatted_event)
-            except websockets.exceptions.ConnectionClosedError as e:
-                print(f"WebSocket 연결이 끊어짐: {e}")
-                raise
             except Exception as e:
-                print(f"메시지 전송 실패: {e}")
                 raise
 
         async def event_stream() -> AsyncIterator[dict[str, Any]]:
@@ -215,12 +205,17 @@ class OpenAIVoiceReactAgent(BaseModel):
     tools: list[BaseTool] | None = None
     url: str = Field(default=DEFAULT_URL)
     user_info: dict[str, Any] | None = None
+    silence_duration_ms: int = Field(default=1200)  # 1.2초 침묵 감지 (빠른 응답)
+    
+    # 턴 관리 상태 변수
+    _is_ai_responding: bool = PrivateAttr(default=False)
+    _is_user_speaking: bool = PrivateAttr(default=False)
+    _has_audio_response: bool = PrivateAttr(default=False)
 
     async def aconnect(
         self,
         input_stream: AsyncIterator[str],
         send_output_chunk: Callable[[str], Coroutine[Any, Any, None]],
-        stop_event: asyncio.Event = None,  # 추가
     ) -> None:
         """
         Connect to the OpenAI API and send and receive messages.
@@ -268,6 +263,12 @@ class OpenAIVoiceReactAgent(BaseModel):
                         "input_audio_transcription": {
                             "model": "whisper-1",
                         },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.8,  # 잡음 필터링 강화 (0.6 → 0.8)
+                            "prefix_padding_ms": 200,
+                            "silence_duration_ms": self.silence_duration_ms
+                        },
                         "tools": tool_defs,
                     },
                 }
@@ -277,64 +278,106 @@ class OpenAIVoiceReactAgent(BaseModel):
                 output_speaker=model_receive_stream,
                 tool_outputs=tool_executor.output_iterator(),
             ):
-                if stop_event and stop_event.is_set():
-                    print("응답 중단됨 - 새로운 응답 준비")
-                    # 응답만 중단하고 세션은 유지
-                    stop_event.clear()
-                    # 새로운 응답을 위한 초기화
-                    await model_send({"type": "response.create", "response": {}})
-                    continue
                 try:
                     data = (
                         json.loads(data_raw) if isinstance(data_raw, str) else data_raw
                     )
                 except json.JSONDecodeError:
-                    print("error decoding data:", data_raw)
                     continue
 
                 if stream_key == "input_mic":
-                    # 사용자가 말을 시작하면 AI 응답 중단
-                    if isinstance(data, dict) and data.get("type") == "input_audio_buffer.speech_started":
-                        print("사용자 음성 감지 - AI 응답 중단")
-                        if stop_event:
-                            stop_event.set()
+                    # 클라이언트에서 보내는 이벤트 처리
+                    if isinstance(data, dict):
+                        event_type = data.get("type")
+                        
+                        if event_type == "client_audio_playback_complete":
+                            print("AI 응답 완료")
+                            if self._is_ai_responding and self._has_audio_response:
+                                self._is_ai_responding = False
+                                self._has_audio_response = False
+                            # OpenAI API로 전송하지 않음
+                            continue
+                            
+                        # AI가 응답 중일 때는 사용자 음성 이벤트 무시 (오디오 데이터는 계속 처리)
+                        if self._is_ai_responding and event_type in ["input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"]:
+                            print(f"AI 응답 중이므로 음성 이벤트 무시: {event_type}")
+                            continue
+                            
                     await model_send(data)
                 elif stream_key == "tool_outputs":
-                    # print("tool output", data)
                     await model_send(data)
-                    await model_send({"type": "response.create", "response": {}})
+                    # 툴 실행 후 AI 응답 시작 (턴 기반)
+                    if not self._is_user_speaking:
+                        self._is_ai_responding = True
+                        self._has_audio_response = False  # 새 응답 시작 시 리셋
+                        await model_send({"type": "response.create", "response": {}})
                 elif stream_key == "output_speaker":
                     t = data["type"]
                     
-                    # AI 응답 중단 확인
-                    if stop_event and stop_event.is_set():
-                        if t == "response.audio.delta":
-                            print("AI 응답 중단됨")
-                            continue
-                        elif t == "response.function_call_arguments.done":
-                            print("툴 호출 중단됨")
-                            continue
-                        elif t == "response.audio_transcript.done":
-                            print("트랜스크립트 처리 중단됨")
-                            continue
+                    # OpenAI VAD 이벤트 처리
+                    if t == "input_audio_buffer.speech_started":
+                        print("🎤 사용자 음성 시작 감지")
+                        self._is_user_speaking = True
+                    elif t == "input_audio_buffer.speech_stopped":
+                        print("🛑 사용자 음성 종료 감지")
+                        self._is_user_speaking = False
+                        # 사용자 음성 완료 후 AI 응답 트리거 (턴 기반)
+                        if not self._is_ai_responding:
+                            print("🚀 AI 응답 시작")
+                            self._is_ai_responding = True
+                            self._has_audio_response = False  # 새 응답 시작 시 리셋
+                            await model_send({"type": "response.create", "response": {}})
+                    elif t == "input_audio_buffer.committed":
+                        print("📝 사용자 오디오 버퍼 커밋됨")
                     
-                    # 정상 처리
-                    if t == "response.audio.delta":
-                        await send_output_chunk(json.dumps(data))
+                    # AI 응답 상태 관리
+                    elif t == "response.audio.delta":
+                        if not self._is_ai_responding:
+                            print("🎬 AI 오디오 응답 시작")
+                        self._is_ai_responding = True
+                        self._has_audio_response = True  # 오디오 응답 감지
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"오디오 델타 전송 실패: {e}")
+                            break
                     elif t == "response.function_call_arguments.done":
+                        self._is_ai_responding = True
                         await tool_executor.add_tool_call(data)
+                    elif t == "response.audio.done":
+                        print("🎯 AI 오디오 스트리밍 완료 - 프론트엔드로 전송")
+                        try:
+                            await send_output_chunk(json.dumps(data))  # 프론트엔드로 전송
+                        except Exception as e:
+                            print(f"오디오 완료 신호 전송 실패: {e}")
+                            # WebSocket 끊어진 경우에도 상태 정리
+                            if self._is_ai_responding and self._has_audio_response:
+                                print("연결 끊어짐으로 인한 상태 정리")
+                                self._is_ai_responding = False
+                                self._has_audio_response = False
                     elif t == "response.audio_transcript.done":
                         print("model:", data["transcript"])
+                    elif t == "response.done":
+                        print(f"📝 response.done (오디오 응답: {self._has_audio_response})")
+                        if not self._has_audio_response:
+                            # 텍스트만 있는 응답인 경우에만 여기서 완료 처리
+                            print("📝 텍스트 전용 응답 완료")
+                            self._is_ai_responding = False
+                        else:
+                            # 오디오 응답이 있는데 response.audio.done이 오지 않는 경우 대비
+                            print("⚠️ 오디오 응답 완료 - response.audio.done 미수신으로 여기서 처리")
+                            # 여기서는 상태 변경하지 않고 프론트엔드 신호만 기다림
                     elif t == "conversation.item.input_audio_transcription.completed":
                         print("user:", data["transcript"])
                     elif t == "error":
                         error_code = data.get("error", {}).get("code")
                         if error_code != "conversation_already_has_active_response":
                             print("error:", data)
+                        self._is_ai_responding = False  # 오류 시에도 상태 리셋
                     elif t in EVENTS_TO_IGNORE:
                         pass
                     else:
-                        print(t)
+                        print(f"🔍 처리되지 않은 이벤트: {t}")
 
 
 __all__ = ["OpenAIVoiceReactAgent"]

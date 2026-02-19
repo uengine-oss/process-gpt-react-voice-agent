@@ -18,7 +18,6 @@ DEFAULT_URL = "wss://api.openai.com/v1/realtime"
 EVENTS_TO_IGNORE = {
     "response.function_call_arguments.delta",
     "rate_limits.updated",
-    "response.audio_transcript.delta",
     "response.created",
     "response.content_part.added",
     "response.content_part.done",
@@ -205,6 +204,7 @@ class OpenAIVoiceReactAgent(BaseModel):
     tools: list[BaseTool] | None = None
     url: str = Field(default=DEFAULT_URL)
     user_info: dict[str, Any] | None = None
+    conversation_history: list[dict[str, Any]] | None = None
     silence_duration_ms: int = Field(default=1200)  # 1.2초 침묵 감지 (빠른 응답)
     
     # 턴 관리 상태 변수
@@ -273,6 +273,29 @@ class OpenAIVoiceReactAgent(BaseModel):
                     },
                 }
             )
+
+            # 이전 대화 히스토리를 OpenAI Realtime 컨텍스트에 주입한다.
+            # conversation.item.create 이벤트로 이전 턴을 재현해 컨텍스트를 유지한다.
+            for msg in (self.conversation_history or []):
+                role = msg.get("role", "")
+                content = (msg.get("content") or "").strip()
+                if role not in ("user", "assistant") or not content:
+                    continue
+                content_type = "input_text" if role == "user" else "text"
+                try:
+                    await model_send({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": content_type, "text": content}],
+                        },
+                    })
+                except Exception as e:
+                    print(f"히스토리 주입 실패 ({role}): {e}")
+            if self.conversation_history:
+                print(f"✅ 대화 히스토리 {len(self.conversation_history)}턴 주입 완료")
+
             async for stream_key, data_raw in amerge(
                 input_mic=input_stream,
                 output_speaker=model_receive_stream,
@@ -318,9 +341,28 @@ class OpenAIVoiceReactAgent(BaseModel):
                     if t == "input_audio_buffer.speech_started":
                         print("🎤 사용자 음성 시작 감지")
                         self._is_user_speaking = True
+                        # 인터럽트: AI 응답 중 사용자가 발화하면 현재 응답 취소
+                        if self._is_ai_responding:
+                            print("⚡ 인터럽트: AI 응답 취소")
+                            self._is_ai_responding = False
+                            self._has_audio_response = False
+                            try:
+                                await model_send({"type": "response.cancel"})
+                            except Exception as e:
+                                print(f"response.cancel 전송 실패: {e}")
+                        # 클라이언트에 전달 (오디오 즉시 중단 트리거)
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"speech_started 전송 실패: {e}")
                     elif t == "input_audio_buffer.speech_stopped":
                         print("🛑 사용자 음성 종료 감지")
                         self._is_user_speaking = False
+                        # 클라이언트에 전달
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"speech_stopped 전송 실패: {e}")
                         # 사용자 음성 완료 후 AI 응답 트리거 (턴 기반)
                         if not self._is_ai_responding:
                             print("🚀 AI 응답 시작")
@@ -355,11 +397,32 @@ class OpenAIVoiceReactAgent(BaseModel):
                                 print("연결 끊어짐으로 인한 상태 정리")
                                 self._is_ai_responding = False
                                 self._has_audio_response = False
+                    elif t == "response.audio_transcript.delta":
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"트랜스크립트 델타 전송 실패: {e}")
                     elif t == "response.audio_transcript.done":
-                        print("model:", data["transcript"])
+                        print("model:", data.get("transcript", ""))
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"트랜스크립트 완료 전송 실패: {e}")
+                    elif t == "conversation.item.input_audio_transcription.completed":
+                        print("user:", data.get("transcript", ""))
+                        try:
+                            await send_output_chunk(json.dumps(data))
+                        except Exception as e:
+                            print(f"사용자 트랜스크립트 전송 실패: {e}")
                     elif t == "response.done":
-                        print(f"📝 response.done (오디오 응답: {self._has_audio_response})")
-                        if not self._has_audio_response:
+                        status = (data.get("response") or {}).get("status", "")
+                        print(f"📝 response.done (상태: {status}, 오디오 응답: {self._has_audio_response})")
+                        if status == "cancelled":
+                            # 인터럽트로 취소된 응답: 상태 리셋
+                            print("📝 response.done (취소됨) - 상태 리셋")
+                            self._is_ai_responding = False
+                            self._has_audio_response = False
+                        elif not self._has_audio_response:
                             # 텍스트만 있는 응답인 경우에만 여기서 완료 처리
                             print("📝 텍스트 전용 응답 완료")
                             self._is_ai_responding = False
@@ -367,8 +430,6 @@ class OpenAIVoiceReactAgent(BaseModel):
                             # 오디오 응답이 있는데 response.audio.done이 오지 않는 경우 대비
                             print("⚠️ 오디오 응답 완료 - response.audio.done 미수신으로 여기서 처리")
                             # 여기서는 상태 변경하지 않고 프론트엔드 신호만 기다림
-                    elif t == "conversation.item.input_audio_transcription.completed":
-                        print("user:", data["transcript"])
                     elif t == "error":
                         error_code = data.get("error", {}).get("code")
                         if error_code != "conversation_already_has_active_response":

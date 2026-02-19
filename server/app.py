@@ -11,7 +11,7 @@ from starlette.websockets import WebSocket
 from langchain_openai_voice import OpenAIVoiceReactAgent
 
 from server.utils import websocket_stream
-from server.prompt import INSTRUCTIONS
+from server.prompt import build_agent_instructions
 from server.tools import TOOLS
 
 from dotenv import load_dotenv
@@ -36,6 +36,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 user_sessions[session_id]["email"] = payload.get("email")
                 user_sessions[session_id]["chat_room_id"] = payload.get("chat_room_id")
                 user_sessions[session_id]["tenant_id"] = payload.get("tenant_id")
+                user_sessions[session_id]["_agent_info"] = payload.get("agent_info")
+                user_sessions[session_id]["_conversation_history"] = payload.get("conversation_history") or []
                 break
     except Exception as e:
         print(f"사용자 정보 수신 중 에러: {e}")
@@ -43,18 +45,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     browser_receive_stream = websocket_stream(websocket)
 
+    agent_info = user_sessions[session_id].pop("_agent_info", None)
+    conversation_history = user_sessions[session_id].pop("_conversation_history", [])
     user_info = user_sessions[session_id]
-    user_info_str = "\n".join(f"{k}: {v}" for k, v in user_info.items())
-    instructions_with_user = (
-        f"{INSTRUCTIONS}\n"
-        "[User Info]\n"
-        f"{user_info_str}\n"
-        "- 모든 툴 호출 시 tenant_id와 query를 반드시 파라미터로 포함하세요. "
-        f"tenant_id는 '{user_info.get('tenant_id')}' 입니다."
-    )
-    
+    instructions_with_user = build_agent_instructions(agent_info, user_info)
+
+    agent_name = (agent_info or {}).get("username") or "기본"
     print(f"OpenAI API Key 설정됨: {bool(os.getenv('OPENAI_API_KEY'))}")
     print(f"사용자 정보: {user_info}")
+    print(f"에이전트: {agent_name}")
+    print(f"대화 히스토리: {len(conversation_history)}턴")
     
     agent = OpenAIVoiceReactAgent(
         model="gpt-4o-realtime-preview",
@@ -62,6 +62,7 @@ async def websocket_endpoint(websocket: WebSocket):
         instructions=instructions_with_user,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         user_info=user_info,
+        conversation_history=conversation_history,
         silence_duration_ms=1200  # 1.2초로 단축 (빠른 응답)
     )
 

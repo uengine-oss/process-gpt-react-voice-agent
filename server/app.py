@@ -57,7 +57,7 @@ async def websocket_endpoint(websocket: WebSocket):
     print(f"대화 히스토리: {len(conversation_history)}턴")
     
     agent = OpenAIVoiceReactAgent(
-        model="gpt-4o-realtime-preview",
+        model="gpt-realtime",
         tools=TOOLS,
         instructions=instructions_with_user,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
@@ -120,9 +120,9 @@ async def websocket_realtime_proxy(websocket: WebSocket):
     openai_realtime_model = "gpt-realtime"
     openai_realtime_url = "wss://api.openai.com/v1/realtime"
     target_url = f"{openai_realtime_url}?model={openai_realtime_model}"
+    # 정식 규격에서는 베타 헤더를 붙이면 거절당한다.
     headers = {
         "Authorization": f"Bearer {openai_api_key}",
-        "OpenAI-Beta": "realtime=v1",
     }
 
     if not openai_api_key:

@@ -12,10 +12,49 @@ from langchain_core.utils import secret_from_env
 
 from pydantic import BaseModel, Field, SecretStr, PrivateAttr
 
-DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-10-01"
+# OpenAI 가 Realtime 을 정식(GA)으로 올리면서 베타 모양을 껐다. 옛 모델·헤더로
+# 연결하면 `invalid_request_error.beta_api_shape_disabled` 로 끊긴다 —
+# 화면에는 "연결 중" 에서 멈춘 것처럼 보여 원인이 드러나지 않는다.
+DEFAULT_MODEL = "gpt-realtime"
 DEFAULT_URL = "wss://api.openai.com/v1/realtime"
 
+# 정식 규격에서 바뀐 이벤트 이름. 화면(웹·앱)은 예전 이름으로 듣고 있으므로
+# 여기서 되돌려 보낸다 — 양쪽을 동시에 고치면 배포 순서가 어긋나는 동안
+# 음성이 통째로 멎는다.
+GA_EVENT_ALIASES = {
+    "response.output_audio.delta": "response.audio.delta",
+    "response.output_audio.done": "response.audio.done",
+    "response.output_audio_transcript.delta": "response.audio_transcript.delta",
+    "response.output_audio_transcript.done": "response.audio_transcript.done",
+}
+
+
+def realtime_headers(api_key: str) -> dict:
+    """
+    Realtime 에 붙을 때 쓰는 헤더.
+
+    예전에는 `OpenAI-Beta: realtime=v1` 을 붙였다. 그 헤더는 "베타 모양으로
+    붙겠다" 는 뜻인데, OpenAI 가 정식으로 올리면서 그 모양을 껐다. 지금 붙이면
+    `beta_api_shape_disabled` 로 끊긴다 — 화면에는 "연결 중" 에서 멈춘 것처럼
+    보여 원인이 드러나지 않는다.
+    """
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def normalize_event(data: dict) -> dict:
+    """정식 규격의 이벤트를 예전 이름으로 바꾼다. 그 밖의 것은 그대로 둔다."""
+    if not isinstance(data, dict):
+        return data
+    legacy = GA_EVENT_ALIASES.get(data.get("type"))
+    if not legacy:
+        return data
+    return {**data, "type": legacy}
+
+
 EVENTS_TO_IGNORE = {
+    # 정식 규격에서 새로 생긴 것들. 우리가 쓸 일이 없다.
+    "conversation.item.added",
+    "conversation.item.done",
     "response.function_call_arguments.delta",
     "rate_limits.updated",
     "response.created",
@@ -37,16 +76,13 @@ async def connect(*, api_key: str, model: str, url: str, max_retries: int = 3) -
     None,
 ]:
     """
-    async with connect(model="gpt-4o-realtime-preview-2024-10-01") as websocket:
+    async with connect(model="gpt-realtime") as websocket:
         await websocket.send("Hello, world!")
         async for message in websocket:
             print(message)
     """
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "OpenAI-Beta": "realtime=v1",
-    }
+    headers = realtime_headers(api_key)
 
     url = url or DEFAULT_URL
     url += f"?model={model}"
@@ -257,17 +293,23 @@ class OpenAIVoiceReactAgent(BaseModel):
             ]
             await model_send(
                 {
+                    # 정식 규격은 오디오 설정을 session.audio 아래로 옮겼다.
+                    # 예전처럼 평평하게 보내면 조용히 무시되어, 사용자가 말해도
+                    # 아무 반응이 없고 전사도 오지 않는다.
                     "type": "session.update",
                     "session": {
+                        "type": "realtime",
                         "instructions": instructions,
-                        "input_audio_transcription": {
-                            "model": "whisper-1",
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.8,  # 잡음 필터링 강화 (0.6 → 0.8)
-                            "prefix_padding_ms": 200,
-                            "silence_duration_ms": self.silence_duration_ms
+                        "audio": {
+                            "input": {
+                                "transcription": {"model": "whisper-1"},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "threshold": 0.8,  # 잡음 필터링 강화
+                                    "prefix_padding_ms": 200,
+                                    "silence_duration_ms": self.silence_duration_ms,
+                                },
+                            }
                         },
                         "tools": tool_defs,
                     },
@@ -307,6 +349,10 @@ class OpenAIVoiceReactAgent(BaseModel):
                     )
                 except json.JSONDecodeError:
                     continue
+
+                # 정식 규격의 이름을 예전 이름으로 되돌린다. 아래의 판단과
+                # 화면으로 내보내는 것이 모두 예전 이름을 쓴다.
+                data = normalize_event(data)
 
                 if stream_key == "input_mic":
                     # 클라이언트에서 보내는 이벤트 처리

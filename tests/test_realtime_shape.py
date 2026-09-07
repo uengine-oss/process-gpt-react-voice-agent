@@ -89,3 +89,17 @@ def test_오디오_설정을_session_audio_아래에_보낸다():
     assert '"audio": {' in source
     # 평평한 옛 자리에 두면 안 된다.
     assert '"input_audio_transcription": {' not in source
+
+
+def test_지난_대화를_다시_넣을_때_쓰는_내용_종류():
+    """
+    정식 규격에서 에이전트가 한 말은 `output_text` 다. 예전 이름 `text` 로 보내면
+    그 항목만 거절당하는데, 세션은 살아 있어서 화면에는 아무 표시가 없다.
+    대신 에이전트가 방금 자기가 한 말을 모르는 채로 대화를 시작한다.
+    """
+    assert voice.history_content_type("user") == "input_text"
+    assert voice.history_content_type("assistant") == "output_text"
+
+
+def test_에이전트_말에_예전_이름을_쓰지_않는다():
+    assert voice.history_content_type("assistant") != "text"

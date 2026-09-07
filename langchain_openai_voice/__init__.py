@@ -41,6 +41,22 @@ def realtime_headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def history_content_type(role: str) -> str:
+    """
+    지난 대화를 다시 넣을 때 쓸 내용 종류.
+
+    정식 규격에서 **에이전트가 한 말은 `output_text`** 다. 예전 이름인 `text` 로
+    보내면 그 항목만 거절당한다.
+
+        Invalid value: 'text'. Value must be 'output_text'.
+
+    거절돼도 세션은 그대로 살아 있어서 화면에는 아무 표시가 없다. 대신 에이전트가
+    **방금 자기가 한 말을 모르는 채로** 대화를 시작한다 — 사용자는 왜 말귀를
+    못 알아듣는지 알 수 없다. 실제로 그랬다.
+    """
+    return "input_text" if role == "user" else "output_text"
+
+
 def normalize_event(data: dict) -> dict:
     """정식 규격의 이벤트를 예전 이름으로 바꾼다. 그 밖의 것은 그대로 둔다."""
     if not isinstance(data, dict):
@@ -323,7 +339,7 @@ class OpenAIVoiceReactAgent(BaseModel):
                 content = (msg.get("content") or "").strip()
                 if role not in ("user", "assistant") or not content:
                     continue
-                content_type = "input_text" if role == "user" else "text"
+                content_type = history_content_type(role)
                 try:
                     await model_send({
                         "type": "conversation.item.create",

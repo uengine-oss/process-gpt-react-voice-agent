@@ -113,10 +113,11 @@ def voice_rules(tools: Any, user_info: dict | None, instructions: str) -> str:
     lines = ["[음성 대화 규칙]", "- 지금은 음성 대화다. JSON·필드 name·코드는 소리 내어 읽지 않는다. 한두 문장으로 짧게 말한다."]
     if "update_form_fields" in names:
         lines.append(
-            "- 사용자가 폼에 넣을 값을 말하면 되묻기 전에 곧바로 update_form_fields 로 그 필드들을 채운다"
-            "(한 번에 여러 개). 값을 고쳐 말하면 바뀐 필드만 다시 채운다. 채운 뒤 무엇을 채웠는지 짧게 확인하고,"
-            " 아직 비어 있는 항목이 있으면 하나만 묻는다."
+            "- 사용자가 폼에 넣을 값을 말하면, 말로 대답하기 전에 반드시 먼저 update_form_fields 를 호출해 그 필드들을"
+            " 채운다(한 번에 여러 개). 도구를 부르지 않은 채 「입력했어요」「입력할게요」라고 말하지 않는다 — 말만 하면"
+            " 화면의 칸은 비어 있다. 이 규칙이 위의 「JSON 패치 제안 형식」보다 앞선다: 음성에서는 패치를 말하지 말고 도구로 보낸다."
         )
+        lines.append("- 값을 고쳐 말하면 바뀐 필드만 update_form_fields 로 다시 채운다. 채운 뒤 무엇을 채웠는지 짧게 확인하고, 아직 비어 있는 항목이 있으면 하나만 묻는다.")
     if "submit_form" in names:
         lines.append("- 사용자가 제출을 요청하면 submit_form(confirm=true) 을 호출하고, 결과를 짧게 알린다.")
     # 화면이 보낸 user_info 는 OpenAI 로 가지 않는다 — 지침에 아직 없으면 여기서 알려 준다

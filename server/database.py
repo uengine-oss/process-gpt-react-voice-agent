@@ -397,18 +397,53 @@ def fetch_process_instance_list(user_id: str, process_definition_id: Optional[st
         if not tenant_id:
             tenant_id = subdomain
 
-        if process_definition_id:
-            response = supabase.table('bpm_proc_inst').select("*").eq('tenant_id', tenant_id).eq('proc_def_id', process_definition_id).filter('participants', 'cs', '{' + user_id + '}').execute()
-        else:
-            response = supabase.table('bpm_proc_inst').select("*").eq('tenant_id', tenant_id).filter('participants', 'cs', '{' + user_id + '}').execute()
-        
-        if response.data:
-            return [ProcessInstance(**item) for item in response.data]
+        # participants 에도 uid 가 들어 있다 — 이메일이면 uid 로 찾는다(user_keys)
+        rows: Dict[str, Dict[str, Any]] = {}
+        for key in user_keys(supabase, user_id):
+            q = supabase.table('bpm_proc_inst').select("*").eq('tenant_id', tenant_id)
+            if process_definition_id:
+                q = q.eq('proc_def_id', process_definition_id)
+            for item in q.filter('participants', 'cs', '{' + key + '}').execute().data or []:
+                rows.setdefault(item.get("proc_inst_id") or str(len(rows)), item)
+
+        if rows:
+            return [ProcessInstance(**item) for item in rows.values()]
         else:
             return None
     except Exception as e:
         logger.error(str(e))
         raise Exception(str(e)) from e
+
+def user_keys(supabase, user: str) -> List[str]:
+    """
+    도구가 받은 사용자(이메일)로 찾을 열쇠들 — uid 먼저, 받은 값도 그대로.
+
+    todolist.user_id 와 bpm_proc_inst.participants 에는 **uid** 가 들어 있다(여럿이면 쉼표로).
+    도구는 이메일을 받으므로 `user_id like '%이메일%'` 로는 하나도 찾지 못해, 대화방 음성
+    모드가 할 일이 있는데도 늘 「할 일이 없습니다」 라고 대답했다.
+    """
+    keys: List[str] = []
+    if user and "@" in user:
+        try:
+            rows = supabase.table("users").select("id").eq("email", user).execute().data or []
+            keys += [r["id"] for r in rows if r.get("id")]
+        except Exception as e:
+            logger.error(f"uid lookup by email failed: {e}")
+    if user:
+        keys.append(user)
+    return list(dict.fromkeys(keys))
+
+
+def _todolist_rows(supabase, user: str, tenant_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    for key in user_keys(supabase, user):
+        q = supabase.table('todolist').select("*").like('user_id', f'%{key}%').eq('tenant_id', tenant_id)
+        if status:
+            q = q.eq('status', status)
+        for item in q.execute().data or []:
+            rows.setdefault(item["id"], item)
+    return list(rows.values())
+
 
 def fetch_todolist_by_user_id(user_id: str, tenant_id: Optional[str] = None) -> Optional[List[WorkItem]]:
     try:
@@ -422,10 +457,10 @@ def fetch_todolist_by_user_id(user_id: str, tenant_id: Optional[str] = None) -> 
         if not tenant_id:
             tenant_id = subdomain
 
-        response = supabase.table('todolist').select("*").like('user_id', f'%{user_id}%').eq('tenant_id', tenant_id).execute()
-        
-        if response.data:
-            return [WorkItem(**item) for item in response.data]
+        data = _todolist_rows(supabase, user_id, tenant_id)
+
+        if data:
+            return [WorkItem(**item) for item in data]
         else:
             return None
     except Exception as e:
@@ -443,10 +478,10 @@ def fetch_todolist_by_user_id_and_status(user_id: str, status: str, tenant_id: O
         if not tenant_id:
             tenant_id = subdomain
 
-        response = supabase.table('todolist').select("*").like('user_id', f'%{user_id}%').eq('status', status).eq('tenant_id', tenant_id).execute()
+        data = _todolist_rows(supabase, user_id, tenant_id, status)
 
-        if response.data:
-            return [WorkItem(**item) for item in response.data]
+        if data:
+            return [WorkItem(**item) for item in data]
         else:
             return None
     except Exception as e:

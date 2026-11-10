@@ -13,6 +13,7 @@ from langchain_openai_voice import OpenAIVoiceReactAgent
 from server.utils import websocket_stream
 from server.prompt import build_agent_instructions
 from server.tools import TOOLS
+from server.realtime_proxy import ProxyState, client_to_openai, openai_to_client, parse as parse_event
 
 from dotenv import load_dotenv
 
@@ -83,7 +84,7 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"세션 정리 완료: {session_id}")
 
 
-async def _client_to_openai(client_ws: WebSocket, openai_ws: websockets.WebSocketClientProtocol):
+async def _client_to_openai(client_ws: WebSocket, openai_ws: websockets.WebSocketClientProtocol, state: ProxyState):
     while True:
         try:
             message = await client_ws.receive()
@@ -92,28 +93,51 @@ async def _client_to_openai(client_ws: WebSocket, openai_ws: websockets.WebSocke
         if message.get("text") is not None:
             if message["text"] == "":
                 continue
-            await openai_ws.send(message["text"])
+            event = parse_event(message["text"])
+            if event is None:
+                print("[realtime-proxy] dropped a non-JSON text frame from the browser")
+                continue
+            for out in client_to_openai(event, state):
+                await openai_ws.send(json.dumps(out))
+            _flush_log(state)
         elif message.get("bytes") is not None:
             await openai_ws.send(message["bytes"])
         else:
             break
 
 
-async def _openai_to_client(client_ws: WebSocket, openai_ws: websockets.WebSocketClientProtocol):
+async def _openai_to_client(client_ws: WebSocket, openai_ws: websockets.WebSocketClientProtocol, state: ProxyState):
     try:
         async for message in openai_ws:
             if isinstance(message, bytes):
                 await client_ws.send_bytes(message)
-            else:
+                continue
+            event = parse_event(message)
+            if event is None:
                 await client_ws.send_text(message)
-    except Exception:
-        pass
+                continue
+            to_client, to_openai = openai_to_client(event, state)
+            for out in to_openai:
+                await openai_ws.send(json.dumps(out))
+            if to_client is not None:
+                await client_ws.send_text(json.dumps(to_client))
+            _flush_log(state)
+    except Exception as e:
+        print(f"[realtime-proxy] openai->client stopped: {type(e).__name__}")
+
+
+def _flush_log(state: ProxyState):
+    for line in state.log:
+        print(f"[realtime-proxy] {line}")
+    state.log.clear()
 
 
 async def websocket_realtime_proxy(websocket: WebSocket):
     """
-    하위 호환: 기존 voice-agent의 /ws/realtime 프락시 엔드포인트.
-    OpenAI Realtime WebSocket에 단순 중계하여 기존 클라이언트 프로토콜을 유지.
+    하위 호환: 기존 voice-agent의 /ws/realtime 프락시 엔드포인트(업무 폼의 「음성 에이전트」).
+    화면은 Realtime 베타 모양으로 말하고 듣는다. OpenAI 는 정식(GA) 규격만 받으므로
+    오가는 이벤트를 server/realtime_proxy.py 에서 맞춘다(그대로 넘기면 session.update 가
+    거절돼 폼 스키마·도구·지침이 하나도 안 들어가고, 에이전트 목소리도 나지 않는다).
     """
     await websocket.accept()
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
@@ -126,7 +150,7 @@ async def websocket_realtime_proxy(websocket: WebSocket):
     }
 
     if not openai_api_key:
-        await websocket.send_text(json.dumps({"type": "error", "message": "OPENAI_API_KEY not set"}))
+        await websocket.send_text(json.dumps({"type": "error", "error": {"type": "proxy_error", "message": "OPENAI_API_KEY not set"}, "message": "OPENAI_API_KEY not set"}))
         await websocket.close()
         return
 
@@ -134,10 +158,11 @@ async def websocket_realtime_proxy(websocket: WebSocket):
         print(f"[realtime-proxy] connecting -> {target_url}")
         # websockets 12.x: use additional_headers (voice-agent와 동일)
         async with websockets.connect(target_url, additional_headers=headers, max_size=None) as openai_ws:
-            client_to_openai = asyncio.create_task(_client_to_openai(websocket, openai_ws))
-            openai_to_client = asyncio.create_task(_openai_to_client(websocket, openai_ws))
+            state = ProxyState()
+            up = asyncio.create_task(_client_to_openai(websocket, openai_ws, state))
+            down = asyncio.create_task(_openai_to_client(websocket, openai_ws, state))
             done, pending = await asyncio.wait(
-                [client_to_openai, openai_to_client],
+                [up, down],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
@@ -148,9 +173,11 @@ async def websocket_realtime_proxy(websocket: WebSocket):
                 except Exception:
                     pass
     except Exception as e:
-        print(f"[realtime-proxy] connect/error: {e}")
+        print(f"[realtime-proxy] connect/error: {type(e).__name__}: {e}")
         try:
-            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+            # 화면은 error.message 를 읽는다 — 옛 모양(message)도 함께 둔다
+            text = f"음성 서버가 OpenAI 에 연결하지 못했습니다 ({type(e).__name__})"
+            await websocket.send_text(json.dumps({"type": "error", "error": {"type": "proxy_error", "message": text}, "message": text}))
         except Exception:
             pass
     finally:
